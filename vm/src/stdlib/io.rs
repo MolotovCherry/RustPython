@@ -3869,102 +3869,49 @@ mod fileio {
         type Args = FileIOArgs;
 
         fn init(zelf: PyRef<Self>, args: Self::Args, vm: &VirtualMachine) -> PyResult<()> {
-            // TODO: let atomic_flag_works
-            let name = args.name;
-            let arg_fd = if let Some(i) = name.payload::<crate::builtins::PyInt>() {
-                let fd = i.try_to_primitive(vm)?;
-                if fd < 0 {
-                    return Err(vm.new_value_error("negative file descriptor".to_owned()));
-                }
-                Some(fd)
-            } else {
-                None
-            };
+          let mode_obj = args
+              .mode
+              .unwrap_or_else(|| PyStr::from("rb").into_ref(&vm.ctx));
+          let mode_str = mode_obj.as_str();
+          let name = args.name;
+          let (mode, flags) =
+              compute_mode(mode_str).map_err(|e| vm.new_value_error(e.error_msg(mode_str)))?;
+          zelf.mode.store(mode);
+          let fd = if let Some(opener) = args.opener {
+              let fd = opener.call((name.clone(), flags), vm)?;
+              if !fd.fast_isinstance(vm.ctx.types.int_type) {
+                  return Err(vm.new_type_error("expected integer from opener".to_owned()));
+              }
+              let fd = i32::try_from_object(vm, fd)?;
+              if fd < 0 {
+                  return Err(vm.new_value_error(format!("opener returned {fd}")));
+              }
+              fd
+          } else if let Some(i) = name.payload::<crate::builtins::PyInt>() {
+              i.try_to_primitive(vm)?
+          } else {
+              use crate::ospath::OsPath;
+              let path = OsPath::try_from_object(vm, name.clone())?;
+              if !args.closefd {
+                  return Err(
+                      vm.new_value_error("Cannot use closefd=False with file name".to_owned())
+                  );
+              }
 
-            let mode_obj = args
-                .mode
-                .unwrap_or_else(|| PyStr::from("rb").into_ref(&vm.ctx));
-            let mode_str = mode_obj.as_str();
-            let (mode, flags) =
-                compute_mode(mode_str).map_err(|e| vm.new_value_error(e.error_msg(mode_str)))?;
-            zelf.mode.store(mode);
+              crate::stdlib::os::_os::os_open(path, flags as _, None, Default::default(), vm)?
+          };
 
-            let (fd, filename) = if let Some(fd) = arg_fd {
-                zelf.closefd.store(args.closefd);
-                (fd, OsPathOrFd::Fd(fd))
-            } else {
-                zelf.closefd.store(true);
-                if !args.closefd {
-                    return Err(
-                        vm.new_value_error("Cannot use closefd=False with file name".to_owned())
-                    );
-                }
+          if mode.contains(Mode::APPENDING) {
+              let _ = os::lseek(fd as _, 0, libc::SEEK_END, vm);
+          }
 
-                if let Some(opener) = args.opener {
-                    let fd = opener.call((name.clone(), flags), vm)?;
-                    if !fd.fast_isinstance(vm.ctx.types.int_type) {
-                        return Err(vm.new_type_error("expected integer from opener".to_owned()));
-                    }
-                    let fd = i32::try_from_object(vm, fd)?;
-                    if fd < 0 {
-                        return Err(vm.new_value_error(format!("opener returned {fd}")));
-                    }
-                    (
-                        fd,
-                        OsPathOrFd::try_from_object(vm, name.clone()).unwrap_or(OsPathOrFd::Fd(fd)),
-                    )
-                } else {
-                    let path = OsPath::try_from_object(vm, name.clone())?;
-                    #[cfg(any(unix, target_os = "wasi"))]
-                    let fd = Fd::open(&path.clone().into_cstring(vm)?, flags, 0o666);
-                    #[cfg(windows)]
-                    let fd = Fd::wopen(&path.to_widecstring(vm)?, flags, 0o666);
-                    let filename = OsPathOrFd::Path(path);
-                    match fd {
-                        Ok(fd) => (fd.0, filename),
-                        Err(e) => return Err(IOErrorBuilder::with_filename(&e, filename, vm)),
-                    }
-                }
-            };
-            zelf.fd.store(fd);
-
-            // TODO: _Py_set_inheritable
-
-            let fd_fstat = crate::common::fileutils::fstat(fd);
-
-            #[cfg(windows)]
-            {
-                if let Err(err) = fd_fstat {
-                    return Err(IOErrorBuilder::with_filename(&err, filename, vm));
-                }
-            }
-            #[cfg(any(unix, target_os = "wasi"))]
-            {
-                match fd_fstat {
-                    Ok(status) => {
-                        if (status.st_mode & libc::S_IFMT) == libc::S_IFDIR {
-                            let err = std::io::Error::from_raw_os_error(libc::EISDIR);
-                            return Err(IOErrorBuilder::with_filename(&err, filename, vm));
-                        }
-                    }
-                    Err(err) => {
-                        if err.raw_os_error() == Some(libc::EBADF) {
-                            return Err(IOErrorBuilder::with_filename(&err, filename, vm));
-                        }
-                    }
-                }
-            }
-
-            #[cfg(windows)]
-            crate::stdlib::msvcrt::setmode_binary(fd);
-            zelf.as_object().set_attr("name", name, vm)?;
-
-            if mode.contains(Mode::APPENDING) {
-                let _ = os::lseek(fd as _, 0, libc::SEEK_END, vm);
-            }
-
-            Ok(())
-        }
+          zelf.fd.store(fd);
+          zelf.closefd.store(args.closefd);
+          #[cfg(windows)]
+          crate::stdlib::msvcrt::setmode_binary(fd);
+          zelf.as_object().set_attr("name", name, vm)?;
+          Ok(())
+      }
     }
 
     impl Representable for FileIO {
